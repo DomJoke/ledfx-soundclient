@@ -1,49 +1,80 @@
-FROM python:3.12-slim
+FROM python:3.11-slim
 
 WORKDIR /app
 
-RUN pip install Cython
-RUN dpkg --add-architecture armhf
-RUN apt-get update
-RUN apt-get install -y gcc \
-                       git \
-                       libatlas3-base \
-		       libavformat58 \
-		       portaudio19-dev \
-		       avahi-daemon \
-		       pulseaudio
-RUN pip install --upgrade pip wheel setuptools
-RUN pip install lastversion
-RUN pip install git+https://github.com/LedFx/LedFx
+# -----------------------------
+# System dependencies
+# -----------------------------
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      pulseaudio \
+      pulseaudio-utils \
+      snapclient \
+      squeezelite \
+      avahi-daemon \
+      libnss-mdns \
+      ca-certificates \
+      build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
-RUN apt-get install -y alsa-utils
-RUN adduser root pulse-access
+# -----------------------------
+# Non-root user
+# -----------------------------
+RUN useradd --create-home --shell /bin/bash ledfx
+USER ledfx
+WORKDIR /home/ledfx
 
-# https://gnanesh.me/avahi-docker-non-root.html
-RUN apt-get install -y libnss-mdns
-RUN echo '*' > /etc/mdns.allow \
-	&& sed -i "s/hosts:.*/hosts:          files mdns4 dns/g" /etc/nsswitch.conf \
-	&& printf "[server]\nenable-dbus=no\n" >> /etc/avahi/avahi-daemon.conf \
-	&& chmod 777 /etc/avahi/avahi-daemon.conf \
-	&& mkdir -p /var/run/avahi-daemon \
-	&& chown avahi:avahi /var/run/avahi-daemon \
-	&& chmod 777 /var/run/avahi-daemon
+# -----------------------------
+# Install latest LedFx
+# -----------------------------
+RUN python -m pip install --upgrade pip setuptools wheel && \
+    python -m pip install ledfx
 
-RUN apt-get install -y wget \
-                       libavahi-client3:armhf \
-                       libavahi-common3:armhf \
-                       apt-utils \
-		       libvorbisidec1:armhf
+# -----------------------------
+# PulseAudio config (null sink)
+# -----------------------------
+RUN mkdir -p /home/ledfx/.config/pulse /tmp/pulse
 
-RUN apt-get install -y squeezelite 
+RUN printf "\
+daemonize = no\n\
+exit-idle-time = -1\n\
+flat-volumes = no\n\
+\n\
+load-module module-null-sink sink_name=ledfx_sink sink_properties=device.description=LedFxNull\n\
+set-default-sink ledfx_sink\n\
+" > /home/ledfx/.config/pulse/daemon.conf
 
-ARG TARGETPLATFORM
-RUN if [ "$TARGETPLATFORM" = "linux/arm/v7" ]; then ARCHITECTURE=armhf; elif [ "$TARGETPLATFORM" = "linux/arm64" ]; then ARCHITECTURE=armhf; else ARCHITECTURE=amd64; fi \
-    && lastversion download badaix/snapcast --format assets --filter "^snapclient_(?:(\d+)\.)?(?:(\d+)\.)?(?:(\d+)\-)?(?:(\d)(_$ARCHITECTURE\.deb))$" -o snapclient.deb
+RUN printf "\
+default-server = unix:/tmp/pulse/native\n\
+autospawn = no\n\
+" > /home/ledfx/.config/pulse/client.conf
 
-RUN apt-get install -fy ./snapclient.deb
+ENV PULSE_RUNTIME_PATH=/tmp/pulse
 
-COPY setup-files/ /app/
-RUN chmod a+wrx /app/*
+# -----------------------------
+# Expose UI
+# -----------------------------
+EXPOSE 8888
 
-ENTRYPOINT ./entrypoint.sh
+# -----------------------------
+# Entrypoint
+# -----------------------------
+COPY --chmod=755 <<'EOF' /entrypoint.sh
+#!/bin/bash
+set -e
+
+pulseaudio \
+  --daemonize=no \
+  --exit-idle-time=-1 \
+  --log-target=stderr &
+
+while [ ! -S /tmp/pulse/native ]; do
+  sleep 0.1
+done
+
+echo "PulseAudio ready"
+
+exec ledfx --host 0.0.0.0
+EOF
+
+ENTRYPOINT ["/entrypoint.sh"]
